@@ -1,0 +1,196 @@
+#include <Wire.h>
+#include "Adafruit_TCS34725.h"
+
+// ======================================
+// ESP32 — TCS34725 + 4x HC-SR04
+//
+// ESP32 I2C default: SDA=21  SCL=22
+// ======================================
+
+// ======================================
+// ULTRASONIC PINS (ESP32 GPIO)
+// ======================================
+
+#define TRIG1  13
+#define ECHO1  12
+
+#define TRIG2  14
+#define ECHO2  27
+
+#define TRIG3  26
+#define ECHO3  25
+
+#define TRIG4  33
+#define ECHO4  32
+
+// ======================================
+// TCS34725
+// ======================================
+
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(
+  TCS34725_INTEGRATIONTIME_50MS,
+  TCS34725_GAIN_1X
+);
+
+#define BLACK_RAWC_MAX   20
+#define SILVER_RAWC_MIN  79
+#define SILVER_RAWC_MAX  109
+#define WHITE_RAWC_MIN   110
+#define BLUE_B_OVER_R    30
+#define BLUE_B_OVER_G    15
+
+// ======================================
+// TCS MOVING AVERAGE — 5 SAMPLES
+// ======================================
+
+#define SAMPLES 5
+
+uint16_t rBuf[SAMPLES] = {0};
+uint16_t gBuf[SAMPLES] = {0};
+uint16_t bBuf[SAMPLES] = {0};
+uint16_t cBuf[SAMPLES] = {0};
+int bufIndex    = 0;
+int sampleCount = 0;
+
+void pushSample(uint16_t r, uint16_t g, uint16_t b, uint16_t c) {
+  rBuf[bufIndex] = r;
+  gBuf[bufIndex] = g;
+  bBuf[bufIndex] = b;
+  cBuf[bufIndex] = c;
+  bufIndex = (bufIndex + 1) % SAMPLES;
+  if (sampleCount < SAMPLES) sampleCount++;
+}
+
+void getAveraged(uint16_t &r, uint16_t &g, uint16_t &b, uint16_t &c) {
+  uint32_t sR = 0, sG = 0, sB = 0, sC = 0;
+  for (int i = 0; i < sampleCount; i++) {
+    sR += rBuf[i]; sG += gBuf[i];
+    sB += bBuf[i]; sC += cBuf[i];
+  }
+  r = sR / sampleCount;
+  g = sG / sampleCount;
+  b = sB / sampleCount;
+  c = sC / sampleCount;
+}
+
+// ======================================
+// COLOUR DETECTION
+// ======================================
+
+String detectColor(int r, int g, int b, uint16_t rawC) {
+
+  if (rawC <= BLACK_RAWC_MAX)                return "BLACK";
+
+  if ((b - r) >= BLUE_B_OVER_R &&
+      (b - g) >= BLUE_B_OVER_G)             return "BLUE";
+
+  if (rawC >= WHITE_RAWC_MIN)               return "WHITE";
+
+  if (rawC >= SILVER_RAWC_MIN &&
+      rawC <= SILVER_RAWC_MAX)              return "SILVER";
+
+  return "UNKNOWN";
+}
+
+// ======================================
+// ULTRASONIC DISTANCE
+// ESP32 uses same pulseIn() as Uno
+// ======================================
+
+float getDistance(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  if (duration == 0) return -1;
+  return (duration * 0.034) / 2.0;
+}
+
+// ======================================
+
+void setup() {
+  Serial.begin(115200);   // ESP32 uses 115200 not 9600
+
+  // ESP32 I2C must be started manually with correct pins
+  Wire.begin(21, 22);     // SDA=21  SCL=22
+
+  // Ultrasonic pins
+  pinMode(TRIG1, OUTPUT); pinMode(ECHO1, INPUT);
+  pinMode(TRIG2, OUTPUT); pinMode(ECHO2, INPUT);
+  pinMode(TRIG3, OUTPUT); pinMode(ECHO3, INPUT);
+  pinMode(TRIG4, OUTPUT); pinMode(ECHO4, INPUT);
+
+  // TCS34725
+  if (!tcs.begin()) {
+    Serial.println("ERROR: TCS34725 not found. Check wiring.");
+    while (1);
+  }
+
+  Serial.println("================================");
+  Serial.println("ESP32 — TCS34725 + 4x Ultrasonic");
+  Serial.println("================================");
+}
+
+// ======================================
+
+void loop() {
+
+  // ---- COLOUR READING ----
+  uint16_t rawR, rawG, rawB, rawC;
+  tcs.getRawData(&rawR, &rawG, &rawB, &rawC);
+
+  pushSample(rawR, rawG, rawB, rawC);
+
+  uint16_t avgR, avgG, avgB, avgC;
+  getAveraged(avgR, avgG, avgB, avgC);
+
+  int r = 0, g = 0, b = 0;
+  if (avgC != 0) {
+    r = constrain((int)(((float)avgR / avgC) * 255.0), 0, 255);
+    g = constrain((int)(((float)avgG / avgC) * 255.0), 0, 255);
+    b = constrain((int)(((float)avgB / avgC) * 255.0), 0, 255);
+  }
+
+  String colour = detectColor(r, g, b, avgC);
+
+  // ---- ULTRASONIC READINGS ----
+  float d1 = getDistance(TRIG1, ECHO1);
+  float d2 = getDistance(TRIG2, ECHO2);
+  float d3 = getDistance(TRIG3, ECHO3);
+  float d4 = getDistance(TRIG4, ECHO4);
+
+  // ---- SERIAL OUTPUT ----
+  Serial.println("================================");
+
+  Serial.println("[COLOUR]");
+  Serial.print("R: ");      Serial.print(r);
+  Serial.print("  G: ");    Serial.print(g);
+  Serial.print("  B: ");    Serial.print(b);
+  Serial.print("  rawC: "); Serial.println(avgC);
+  Serial.print(">> ");      Serial.println(colour);
+
+  Serial.println("[ULTRASONIC]");
+
+  Serial.print("S1: ");
+  if (d1 < 0) Serial.println("No echo");
+  else { Serial.print(d1); Serial.println(" cm"); }
+
+  Serial.print("S2: ");
+  if (d2 < 0) Serial.println("No echo");
+  else { Serial.print(d2); Serial.println(" cm"); }
+
+  Serial.print("S3: ");
+  if (d3 < 0) Serial.println("No echo");
+  else { Serial.print(d3); Serial.println(" cm"); }
+
+  Serial.print("S4: ");
+  if (d4 < 0) Serial.println("No echo");
+  else { Serial.print(d4); Serial.println(" cm"); }
+
+  Serial.println("================================");
+
+  delay(300);
+}

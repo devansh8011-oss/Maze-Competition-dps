@@ -1,0 +1,217 @@
+ #include <Wire.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include "Adafruit_TCS34725.h"
+
+// ======================================
+// REPLACE WITH YOUR RECEIVER MAC ADDRESS
+// ======================================
+uint8_t receiverMAC[] = {0x68, 0x09, 0x47, 0x47, 0x03, 0x68};
+
+// ======================================
+// DATA STRUCTURE
+// ======================================
+typedef struct SensorData {
+  char     colour[10];
+  int      r, g, b;
+  uint16_t rawC;
+  float    d1, d2, d3, d4;
+} SensorData;
+
+SensorData data;
+
+// ======================================
+// ULTRASONIC PINS
+// ======================================
+#define TRIG1  13
+#define ECHO1  12
+#define TRIG2  14
+#define ECHO2  27
+#define TRIG3  26
+#define ECHO3  25
+#define TRIG4  33
+#define ECHO4  32
+
+// ======================================
+// TCS34725
+// ======================================
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(
+  TCS34725_INTEGRATIONTIME_50MS,
+  TCS34725_GAIN_1X
+);
+
+#define BLACK_RAWC_MAX   20
+#define SILVER_RAWC_MIN  79
+#define SILVER_RAWC_MAX  109
+#define WHITE_RAWC_MIN   110
+#define BLUE_B_OVER_R    30
+#define BLUE_B_OVER_G    15
+
+// ======================================
+// MOVING AVERAGE
+// ======================================
+#define SAMPLES 5
+
+uint16_t rBuf[SAMPLES] = {0};
+uint16_t gBuf[SAMPLES] = {0};
+uint16_t bBuf[SAMPLES] = {0};
+uint16_t cBuf[SAMPLES] = {0};
+int bufIndex    = 0;
+int sampleCount = 0;
+
+void pushSample(uint16_t r, uint16_t g, uint16_t b, uint16_t c) {
+  rBuf[bufIndex] = r;
+  gBuf[bufIndex] = g;
+  bBuf[bufIndex] = b;
+  cBuf[bufIndex] = c;
+  bufIndex = (bufIndex + 1) % SAMPLES;
+  if (sampleCount < SAMPLES) sampleCount++;
+}
+
+void getAveraged(uint16_t &r, uint16_t &g, uint16_t &b, uint16_t &c) {
+  uint32_t sR = 0, sG = 0, sB = 0, sC = 0;
+  for (int i = 0; i < sampleCount; i++) {
+    sR += rBuf[i]; sG += gBuf[i];
+    sB += bBuf[i]; sC += cBuf[i];
+  }
+  r = sR / sampleCount;
+  g = sG / sampleCount;
+  b = sB / sampleCount;
+  c = sC / sampleCount;
+}
+
+// ======================================
+// COLOUR DETECTION
+// ======================================
+String detectColor(int r, int g, int b, uint16_t rawC) {
+  if (rawC <= BLACK_RAWC_MAX)               return "BLACK";
+  if ((b - r) >= BLUE_B_OVER_R &&
+      (b - g) >= BLUE_B_OVER_G)            return "BLUE";
+  if (rawC >= WHITE_RAWC_MIN)              return "WHITE";
+  if (rawC >= SILVER_RAWC_MIN &&
+      rawC <= SILVER_RAWC_MAX)             return "SILVER";
+  return "UNKNOWN";
+}
+
+// ======================================
+// ULTRASONIC
+// ======================================
+float getDistance(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  if (duration == 0) return -1;
+  return (duration * 0.034) / 2.0;
+}
+
+// ======================================
+// ESP-NOW SEND CALLBACK — core 3.x fix
+// Old: const uint8_t *macAddr
+// New: const wifi_tx_info_t *txInfo
+// ======================================
+void onSent(const wifi_tx_info_t *txInfo, esp_now_send_status_t status) {
+  Serial.print("Send status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+}
+
+// ======================================
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  pinMode(TRIG1, OUTPUT); pinMode(ECHO1, INPUT);
+  pinMode(TRIG2, OUTPUT); pinMode(ECHO2, INPUT);
+  pinMode(TRIG3, OUTPUT); pinMode(ECHO3, INPUT);
+  pinMode(TRIG4, OUTPUT); pinMode(ECHO4, INPUT);
+
+  if (!tcs.begin()) {
+    Serial.println("ERROR: TCS34725 not found.");
+    while (1);
+  }
+
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ERROR: ESP-NOW init failed.");
+    while (1);
+  }
+
+  esp_now_register_send_cb(onSent);
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("ERROR: Failed to add peer.");
+    while (1);
+  }
+
+  Serial.println("================================");
+  Serial.println("SENDER ready — transmitting...");
+  Serial.println("================================");
+}
+
+// ======================================
+
+void loop() {
+
+  // ---- COLOUR ----
+  uint16_t rawR, rawG, rawB, rawC;
+  tcs.getRawData(&rawR, &rawG, &rawB, &rawC);
+  pushSample(rawR, rawG, rawB, rawC);
+
+  uint16_t avgR, avgG, avgB, avgC;
+  getAveraged(avgR, avgG, avgB, avgC);
+
+  int r = 0, g = 0, b = 0;
+  if (avgC != 0) {
+    r = constrain((int)(((float)avgR / avgC) * 255.0), 0, 255);
+    g = constrain((int)(((float)avgG / avgC) * 255.0), 0, 255);
+    b = constrain((int)(((float)avgB / avgC) * 255.0), 0, 255);
+  }
+
+  String colour = detectColor(r, g, b, avgC);
+
+  // ---- PACK DATA ----
+  strncpy(data.colour, colour.c_str(), sizeof(data.colour) - 1);
+  data.colour[sizeof(data.colour) - 1] = '\0';
+  data.r    = r;
+  data.g    = g;
+  data.b    = b;
+  data.rawC = avgC;
+  data.d1   = getDistance(TRIG1, ECHO1);
+  data.d2   = getDistance(TRIG2, ECHO2);
+  data.d3   = getDistance(TRIG3, ECHO3);
+  data.d4   = getDistance(TRIG4, ECHO4);
+
+  // ---- SEND ----
+  esp_now_send(receiverMAC, (uint8_t *)&data, sizeof(data));
+
+  // ---- LOCAL SERIAL ----
+  Serial.println("================================");
+  Serial.println("[COLOUR]");
+  Serial.print("R: "); Serial.print(r);
+  Serial.print("  G: "); Serial.print(g);
+  Serial.print("  B: "); Serial.print(b);
+  Serial.print("  rawC: "); Serial.println(avgC);
+  Serial.print(">> "); Serial.println(colour);
+
+  Serial.println("[ULTRASONIC]");
+  Serial.print("S1: ");
+  data.d1 < 0 ? Serial.println("No echo") : (Serial.print(data.d1), Serial.println(" cm"));
+  Serial.print("S2: ");
+  data.d2 < 0 ? Serial.println("No echo") : (Serial.print(data.d2), Serial.println(" cm"));
+  Serial.print("S3: ");
+  data.d3 < 0 ? Serial.println("No echo") : (Serial.print(data.d3), Serial.println(" cm"));
+  Serial.print("S4: ");
+  data.d4 < 0 ? Serial.println("No echo") : (Serial.print(data.d4), Serial.println(" cm"));
+  Serial.println("================================");
+
+  delay(300);
+}
